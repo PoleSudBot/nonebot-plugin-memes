@@ -3,7 +3,7 @@ from typing import Literal, Optional
 
 from nonebot import get_plugin_config
 from nonebot.log import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
 class MemeListImageConfig(BaseModel):
@@ -31,6 +31,32 @@ class MultipleImageConfig(BaseModel):
     send_forward_msg: bool = False
 
 
+class MemeDailyLimitConfig(BaseModel):
+    mode: Literal["USER", "GROUP", "UIG"] = "USER"
+    max_count: int
+    result: Optional[str] = None
+    group_max_count: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("max_count")
+    @classmethod
+    def validate_max_count(cls, value: int) -> int:
+        if value == -1 or value > 0:
+            return value
+        raise ValueError("max_count must be -1 or greater than 0")
+
+    @field_validator("group_max_count")
+    @classmethod
+    def validate_group_max_count(cls, value: dict[str, int]) -> dict[str, int]:
+        for max_count in value.values():
+            if max_count == -1:
+                continue
+            if max_count <= 0:
+                raise ValueError(
+                    "group_max_count values must be -1 or greater than 0"
+                )
+        return value
+
+
 class Config(BaseModel):
     memes_command_prefixes: Optional[list[str]] = None
     memes_disabled_list: list[str] = []
@@ -41,6 +67,7 @@ class Config(BaseModel):
     memes_random_meme_show_info: bool = True
     memes_list_image_config: MemeListImageConfig = MemeListImageConfig()
     memes_multiple_image_config: MultipleImageConfig = MultipleImageConfig()
+    memes_daily_limit: Optional[MemeDailyLimitConfig] = None
 
 
 memes_config = get_plugin_config(Config)

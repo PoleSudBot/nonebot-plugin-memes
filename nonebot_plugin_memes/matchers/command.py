@@ -1,5 +1,6 @@
 import random
 import traceback
+from datetime import datetime, timedelta
 from itertools import chain
 from typing import Any, Optional, Union
 
@@ -50,10 +51,148 @@ from nonebot_plugin_waiter import waiter
 
 from ..config import memes_config
 from ..manager import meme_manager
-from ..recorder import record_meme_generation
+from ..recorder import (
+    SessionIdType,
+    get_meme_generation_count,
+    record_meme_generation,
+)
 from .utils import UserId
 
 alc_config.command_max_count += 1000
+
+DAILY_LIMIT_REACHED_MSG = "今日表情包制作次数已达上限，请明天再试"
+_daily_limit_notice_date = ""
+_daily_limit_notice_keys: set[str] = set()
+
+
+def get_daily_limit_id_type() -> Optional[SessionIdType]:
+    daily_limit = memes_config.memes_daily_limit
+    if not daily_limit:
+        return None
+
+    mode_mapping = {
+        "USER": SessionIdType.USER,
+        "GROUP": SessionIdType.GROUP,
+        "UIG": SessionIdType.GROUP_USER,
+    }
+    return mode_mapping[daily_limit.mode]
+
+
+def get_daily_limit_result() -> str:
+    daily_limit = memes_config.memes_daily_limit
+    if daily_limit and daily_limit.result:
+        return daily_limit.result
+    return DAILY_LIMIT_REACHED_MSG
+
+
+def get_today_str() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d")
+
+
+def is_superuser(session: Session) -> bool:
+    user = getattr(session, "user", None)
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        return False
+    return str(user_id) in get_driver().config.superusers
+
+
+def is_private_scene(session: Session) -> bool:
+    if hasattr(session.scene, "is_private"):
+        return bool(session.scene.is_private)
+    return getattr(session.scene.type, "value", None) == "private"
+
+
+def normalize_daily_limit_max_count(max_count: int) -> Optional[int]:
+    return None if max_count == -1 else max_count
+
+
+def get_daily_limit_notice_key(session: Session) -> Optional[str]:
+    id_type = get_daily_limit_id_type()
+    if not id_type:
+        return None
+
+    key = f"{session.scope}:{session.self_id}:"
+    if id_type == SessionIdType.USER:
+        return key + f"user:{session.user.id}"
+    if id_type == SessionIdType.GROUP:
+        return key + f"scene:{session.scene.type.value}:{session.scene.id}"
+    return key + (
+        f"scene:{session.scene.type.value}:{session.scene.id}:user:{session.user.id}"
+    )
+
+
+def should_send_daily_limit_notice(session: Session) -> bool:
+    global _daily_limit_notice_date, _daily_limit_notice_keys
+
+    today = get_today_str()
+    if today != _daily_limit_notice_date:
+        _daily_limit_notice_date = today
+        _daily_limit_notice_keys.clear()
+
+    notice_key = get_daily_limit_notice_key(session)
+    if notice_key is None:
+        return True
+    if notice_key in _daily_limit_notice_keys:
+        return False
+
+    _daily_limit_notice_keys.add(notice_key)
+    return True
+
+
+def get_daily_limit_max_count(session: Session) -> Optional[int]:
+    daily_limit = memes_config.memes_daily_limit
+    if not daily_limit:
+        return None
+
+    if daily_limit.mode == "USER" or is_private_scene(session):
+        return normalize_daily_limit_max_count(daily_limit.max_count)
+
+    group_max_count = daily_limit.group_max_count.get(str(session.scene.id))
+    if group_max_count is None:
+        return normalize_daily_limit_max_count(daily_limit.max_count)
+    return normalize_daily_limit_max_count(group_max_count)
+
+
+def should_record_meme_generation(session: Session) -> bool:
+    if is_superuser(session):
+        return False
+
+    daily_limit = memes_config.memes_daily_limit
+    if not daily_limit:
+        return True
+
+    return get_daily_limit_max_count(session) is not None
+
+
+async def check_daily_limit(session: Session) -> bool:
+    if is_superuser(session):
+        return True
+
+    daily_limit = memes_config.memes_daily_limit
+    if not daily_limit:
+        return True
+
+    max_count = get_daily_limit_max_count(session)
+    if max_count is None:
+        return True
+
+    id_type = get_daily_limit_id_type()
+    if not id_type:
+        return True
+
+    time_start = datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    time_stop = time_start + timedelta(days=1)
+    count = await get_meme_generation_count(
+        session,
+        id_type,
+        time_start=time_start,
+        time_stop=time_stop,
+        time_stop_inclusive=False,
+    )
+    return count < max_count
 
 
 async def process(
@@ -69,6 +208,12 @@ async def process(
     show_info: bool = False,
 ):
     meme_images: list[MemeImage] = []
+    should_record_generation = should_record_meme_generation(session)
+
+    if not await check_daily_limit(session):
+        if should_send_daily_limit_notice(session):
+            await matcher.finish(get_daily_limit_result())
+        await matcher.finish()
 
     try:
         for image in images:
@@ -113,14 +258,14 @@ async def process(
     elif isinstance(result, MemeFeedback):
         await matcher.finish(result.feedback)
 
-    await record_meme_generation(session, meme.key)
-
     msg = UniMessage()
     if show_info:
         keywords = "、".join([f'"{keyword}"' for keyword in meme.info.keywords])
         msg += f"关键词：{keywords}"
     msg += UniMessage.image(raw=result)
-    await msg.finish()
+    await msg.send()
+    if should_record_generation:
+        await record_meme_generation(session, meme.key)
 
 
 T_MemeParams = Union[Text, Image, At]

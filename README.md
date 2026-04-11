@@ -153,6 +153,51 @@ memes_params_mismatch_policy='
 - 默认：`True`
 - 说明：使用“随机表情”时是否同时发出表情关键词
 
+#### `memes_daily_limit`
+
+- 类型：`MemeDailyLimitConfig | None`
+- 默认：`None`
+- 说明：每日表情包制作次数限制，仅在表情制作成功并发送后计数；表情列表、详情、搜索、统计等指令不计数
+  - `mode`
+    - 类型：`str`
+    - 默认：`"USER"`
+    - 可选项：`"USER"`（按用户统计今日总制作次数）、`"GROUP"`（按当前会话统计今日总制作次数）、`"UIG"`（按当前会话内的用户统计今日制作次数）
+  - `max_count`
+    - 类型：`int`
+    - 说明：每日最大制作次数；`-1` 表示默认不限额，仅在命中 `group_max_count` 的群中才启用限制
+  - `result`
+    - 类型：`str | None`
+    - 默认：`None`
+    - 说明：超限时返回文案；为空时回退到默认提示
+  - `group_max_count`
+    - 类型：`Dict[str, int]`
+    - 默认：`{}`
+    - 说明：分群上限覆盖，仅对 `GROUP` 和 `UIG` 生效；key 为群号字符串，value 为该群上限；`-1` 表示该群不限制
+- `memes_daily_limit` 在 `.env` 文件中的设置示例如下：
+
+```
+memes_daily_limit='
+{
+  "mode": "UIG",
+  "max_count": -1,
+  "result": "今日表情包额度已用完，请明天再试",
+  "group_max_count": {
+    "178723143": 5,
+    "867237157": 3
+  }
+}
+'
+```
+
+其中：
+
+- `group_max_count` 仅对 `GROUP` / `UIG` 有效，`USER` 模式会忽略该字段
+- 当 `max_count = -1` 时，未配置在 `group_max_count` 中的群不会计数也不会限额
+- 私聊不会命中 `group_max_count`；若 `max_count = -1`，私聊同样不会计数
+- `result` 为空时会回退到默认提示：`今日表情包制作次数已达上限，请明天再试`
+- 同一限制对象在同一天内超限时仅会收到一次提示，后续同日请求会静默拦截
+- 超级用户不会进入每日次数统计，也不会受到每日次数限制
+
 #### `memes_list_image_config`
 
 - 类型：`MemeListImageConfig`

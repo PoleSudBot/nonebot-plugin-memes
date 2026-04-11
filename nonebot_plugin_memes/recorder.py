@@ -12,7 +12,7 @@ from nonebot_plugin_uninfo.orm import (
     UserModel,
     get_session_persist_id,
 )
-from sqlalchemy import ColumnElement, String, select
+from sqlalchemy import ColumnElement, String, func, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .utils import remove_timezone
@@ -70,6 +70,7 @@ def filter_statement(
     meme_key: Optional[str] = None,
     time_start: Optional[datetime] = None,
     time_stop: Optional[datetime] = None,
+    time_stop_inclusive: bool = True,
 ) -> list[ColumnElement[bool]]:
     filter_scene = True
     filter_user = True
@@ -96,8 +97,42 @@ def filter_statement(
     if time_start:
         whereclause.append(MemeGenerationRecord.time >= remove_timezone(time_start))
     if time_stop:
-        whereclause.append(MemeGenerationRecord.time <= remove_timezone(time_stop))
+        time_stop_value = remove_timezone(time_stop)
+        if time_stop_inclusive:
+            whereclause.append(MemeGenerationRecord.time <= time_stop_value)
+        else:
+            whereclause.append(MemeGenerationRecord.time < time_stop_value)
     return whereclause
+
+
+async def get_meme_generation_count(
+    session: Session,
+    id_type: SessionIdType,
+    *,
+    meme_key: Optional[str] = None,
+    time_start: Optional[datetime] = None,
+    time_stop: Optional[datetime] = None,
+    time_stop_inclusive: bool = True,
+) -> int:
+    whereclause = filter_statement(
+        session,
+        id_type,
+        meme_key=meme_key,
+        time_start=time_start,
+        time_stop=time_stop,
+        time_stop_inclusive=time_stop_inclusive,
+    )
+    statement = (
+        select(func.count(MemeGenerationRecord.id))
+        .where(*whereclause)
+        .join(SessionModel, SessionModel.id == MemeGenerationRecord.session_persist_id)
+        .join(BotModel, BotModel.id == SessionModel.bot_persist_id)
+        .join(SceneModel, SceneModel.id == SessionModel.scene_persist_id)
+        .join(UserModel, UserModel.id == SessionModel.user_persist_id)
+    )
+    async with get_session() as db_session:
+        result = await db_session.scalar(statement)
+    return int(result or 0)
 
 
 async def get_meme_generation_records(
