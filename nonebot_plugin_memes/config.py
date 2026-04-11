@@ -32,8 +32,8 @@ class MultipleImageConfig(BaseModel):
 
 
 class MemeDailyLimitConfig(BaseModel):
-    mode: Literal["USER", "GROUP", "UIG"] = "USER"
-    max_count: int
+    mode: Literal["USER", "GROUP", "UIG"] = "UIG"
+    max_count: int = -1
     result: Optional[str] = None
     group_max_count: dict[str, int] = Field(default_factory=dict)
 

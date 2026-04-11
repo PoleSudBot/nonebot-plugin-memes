@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import nonebot
-from pydantic import ValidationError
 import pytest
 
 nonebot.init()
 
 from nonebot_plugin_memes.config import MemeDailyLimitConfig
+from nonebot_plugin_memes.daily_limit_manager import DailyLimitManager
 from nonebot_plugin_memes.matchers import command as command_matcher
+from nonebot_plugin_memes.matchers import manage as manage_matcher
 from nonebot_plugin_memes.recorder import SessionIdType, filter_statement
 
 
@@ -49,12 +51,30 @@ class FakeUniMessage:
         return None
 
 
-def build_session(scene_id: str, scene_type: str, user_id: str):
+def build_session(
+    scene_id: str,
+    scene_type: str,
+    user_id: str,
+    *,
+    role_level: int = 1,
+    self_id: str = "bot",
+    scope: str = "qq",
+):
+    is_private = scene_type == "private"
+    member = None
+    if not is_private:
+        member = SimpleNamespace(role=SimpleNamespace(level=role_level), nick=None)
     return SimpleNamespace(
-        self_id="bot",
-        scope="qq",
-        scene=SimpleNamespace(id=scene_id, type=SimpleNamespace(value=scene_type)),
-        user=SimpleNamespace(id=user_id),
+        self_id=self_id,
+        scope=scope,
+        scene=SimpleNamespace(
+            id=scene_id,
+            type=SimpleNamespace(value=scene_type),
+            is_private=is_private,
+        ),
+        scene_path=f"{scene_type}:{scene_id}",
+        user=SimpleNamespace(id=user_id, avatar=None, nick=None, name=user_id),
+        member=member,
     )
 
 
@@ -69,107 +89,109 @@ def reset_superusers(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(command_matcher.get_driver().config, "superusers", set())
 
 
+@pytest.fixture(autouse=True)
+def reset_daily_limit_config(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(command_matcher.memes_config, "memes_daily_limit", None)
+
+
+@pytest.fixture(autouse=True)
+def fresh_daily_limit_manager(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    manager = DailyLimitManager(tmp_path / "daily_limit.yml")
+    monkeypatch.setattr(command_matcher, "daily_limit_manager", manager)
+    monkeypatch.setattr(manage_matcher, "daily_limit_manager", manager)
+    return manager
+
+
 def clause_columns(session, id_type: SessionIdType) -> set[str]:
     return {str(clause.left) for clause in filter_statement(session, id_type)}
 
 
-@pytest.mark.parametrize(
-    ("id_type", "expected_columns", "unexpected_columns"),
-    [
-        (
-            SessionIdType.USER,
-            {
-                "nonebot_plugin_uninfo_botmodel.self_id",
-                "nonebot_plugin_uninfo_botmodel.scope",
-                "nonebot_plugin_uninfo_usermodel.user_id",
-            },
-            {
-                "nonebot_plugin_uninfo_scenemodel.scene_id",
-                "nonebot_plugin_uninfo_scenemodel.scene_type",
-            },
-        ),
-        (
-            SessionIdType.GROUP,
-            {
-                "nonebot_plugin_uninfo_botmodel.self_id",
-                "nonebot_plugin_uninfo_botmodel.scope",
-                "nonebot_plugin_uninfo_scenemodel.scene_id",
-                "nonebot_plugin_uninfo_scenemodel.scene_type",
-            },
-            {
-                "nonebot_plugin_uninfo_usermodel.user_id",
-            },
-        ),
-        (
-            SessionIdType.GROUP_USER,
-            {
-                "nonebot_plugin_uninfo_botmodel.self_id",
-                "nonebot_plugin_uninfo_botmodel.scope",
-                "nonebot_plugin_uninfo_scenemodel.scene_id",
-                "nonebot_plugin_uninfo_scenemodel.scene_type",
-                "nonebot_plugin_uninfo_usermodel.user_id",
-            },
-            set(),
-        ),
-    ],
-)
-def test_filter_statement_uses_expected_scope_dimensions(
-    id_type: SessionIdType,
-    expected_columns: set[str],
-    unexpected_columns: set[str],
-):
+def test_filter_statement_uses_group_user_scope_dimensions():
     session = build_session("group-1", "group", "user-1")
 
-    columns = clause_columns(session, id_type)
+    columns = clause_columns(session, SessionIdType.GROUP_USER)
 
-    assert expected_columns.issubset(columns)
-    assert columns.isdisjoint(unexpected_columns)
+    assert {
+        "nonebot_plugin_uninfo_botmodel.self_id",
+        "nonebot_plugin_uninfo_botmodel.scope",
+        "nonebot_plugin_uninfo_scenemodel.scene_id",
+        "nonebot_plugin_uninfo_scenemodel.scene_type",
+        "nonebot_plugin_uninfo_usermodel.user_id",
+    }.issubset(columns)
 
 
-def test_filter_statement_keeps_private_session_scope_for_group_modes():
+def test_filter_statement_keeps_private_session_scope_for_group_user_mode():
     private_session = build_session("private-1", "private", "user-1")
 
-    group_columns = clause_columns(private_session, SessionIdType.GROUP)
-    uig_columns = clause_columns(private_session, SessionIdType.GROUP_USER)
+    columns = clause_columns(private_session, SessionIdType.GROUP_USER)
 
-    assert "nonebot_plugin_uninfo_scenemodel.scene_id" in group_columns
-    assert "nonebot_plugin_uninfo_scenemodel.scene_type" in group_columns
-    assert "nonebot_plugin_uninfo_usermodel.user_id" not in group_columns
-
-    assert "nonebot_plugin_uninfo_scenemodel.scene_id" in uig_columns
-    assert "nonebot_plugin_uninfo_scenemodel.scene_type" in uig_columns
-    assert "nonebot_plugin_uninfo_usermodel.user_id" in uig_columns
+    assert "nonebot_plugin_uninfo_scenemodel.scene_id" in columns
+    assert "nonebot_plugin_uninfo_scenemodel.scene_type" in columns
+    assert "nonebot_plugin_uninfo_usermodel.user_id" in columns
 
 
-@pytest.mark.parametrize("invalid_limit", [0, -2])
-def test_daily_limit_config_rejects_invalid_group_override_values(invalid_limit: int):
-    with pytest.raises(ValidationError):
-        MemeDailyLimitConfig(
-            mode="UIG",
-            max_count=2,
-            group_max_count={"group-1": invalid_limit},
-        )
+def test_daily_limit_manager_persists_private_and_group_limits(tmp_path: Path):
+    path = tmp_path / "daily_limit.yml"
+    manager = DailyLimitManager(path)
+    group_session = build_session("group-1", "group", "user-1")
+    private_session = build_session("private-1", "private", "user-1")
+
+    assert manager.get_limit_max_count(group_session) is None
+    assert manager.get_limit_max_count(private_session) is None
+
+    manager.set_group_max_count(group_session, 5)
+    manager.set_private_max_count(private_session, 3)
+
+    reloaded = DailyLimitManager(path)
+    assert reloaded.get_limit_max_count(group_session) == 5
+    assert reloaded.get_limit_max_count(private_session) == 3
+
+    reloaded.set_group_max_count(group_session, -1)
+    assert reloaded.get_limit_max_count(group_session) is None
 
 
-def test_daily_limit_config_accepts_negative_one_default_max_count():
-    config = MemeDailyLimitConfig(mode="UIG", max_count=-1)
+def test_daily_limit_manager_group_limits_are_isolated(
+    fresh_daily_limit_manager: DailyLimitManager,
+):
+    first_group = build_session("group-1", "group", "user-1")
+    second_group = build_session("group-2", "group", "user-1")
 
-    assert config.max_count == -1
+    fresh_daily_limit_manager.set_group_max_count(first_group, 2)
+
+    assert fresh_daily_limit_manager.get_limit_max_count(first_group) == 2
+    assert fresh_daily_limit_manager.get_limit_max_count(second_group) is None
 
 
-@pytest.mark.parametrize("invalid_limit", [0, -2])
-def test_daily_limit_config_rejects_invalid_default_max_count(invalid_limit: int):
-    with pytest.raises(ValidationError):
-        MemeDailyLimitConfig(mode="UIG", max_count=invalid_limit)
+def test_daily_limit_manager_private_limits_are_isolated_by_bot(
+    fresh_daily_limit_manager: DailyLimitManager,
+):
+    first_private = build_session(
+        "private-1", "private", "user-1", self_id="bot-a", scope="qq"
+    )
+    second_private = build_session(
+        "private-1", "private", "user-1", self_id="bot-b", scope="qq"
+    )
+
+    fresh_daily_limit_manager.set_private_max_count(first_private, 2)
+
+    assert fresh_daily_limit_manager.get_limit_max_count(first_private) == 2
+    assert fresh_daily_limit_manager.get_limit_max_count(second_private) is None
+
+
+def test_daily_limit_manager_reads_legacy_private_scalar(tmp_path: Path):
+    path = tmp_path / "daily_limit.yml"
+    path.write_text("private_max_count: 4\ngroup_max_count: {}\n", encoding="utf-8")
+    manager = DailyLimitManager(path)
+    session = build_session("private-1", "private", "user-1")
+
+    assert manager.get_limit_max_count(session) == 4
 
 
 @pytest.mark.asyncio
-async def test_check_daily_limit_skips_query_when_disabled(
+async def test_check_daily_limit_skips_query_when_group_limit_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ):
     count_mock = AsyncMock(return_value=99)
-
-    monkeypatch.setattr(command_matcher.memes_config, "memes_daily_limit", None)
     monkeypatch.setattr(command_matcher, "get_meme_generation_count", count_mock)
 
     assert await command_matcher.check_daily_limit(
@@ -179,226 +201,10 @@ async def test_check_daily_limit_skips_query_when_disabled(
 
 
 @pytest.mark.asyncio
-async def test_check_daily_limit_skips_query_for_superuser(
+async def test_check_daily_limit_skips_query_when_private_limit_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ):
     count_mock = AsyncMock(return_value=99)
-
-    monkeypatch.setattr(command_matcher.get_driver().config, "superusers", {"user-1"})
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode="UIG", max_count=2),
-    )
-    monkeypatch.setattr(command_matcher, "get_meme_generation_count", count_mock)
-
-    assert await command_matcher.check_daily_limit(
-        build_session("group-1", "group", "user-1")
-    )
-    count_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("mode", "expected_id_type"),
-    [
-        ("USER", SessionIdType.USER),
-        ("GROUP", SessionIdType.GROUP),
-        ("UIG", SessionIdType.GROUP_USER),
-    ],
-)
-async def test_check_daily_limit_uses_mode_and_local_day_window(
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-    expected_id_type: SessionIdType,
-):
-    fixed_now = datetime(2026, 4, 10, 15, 30, 45, tzinfo=timezone(timedelta(hours=8)))
-    captured: dict[str, object] = {}
-
-    class FixedDateTime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            if tz is None:
-                return fixed_now
-            return fixed_now.astimezone(tz)
-
-    async def fake_get_count(session, id_type, **kwargs):
-        captured["session"] = session
-        captured["id_type"] = id_type
-        captured.update(kwargs)
-        return 1
-
-    monkeypatch.setattr(command_matcher, "datetime", FixedDateTime)
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode=mode, max_count=2),
-    )
-    monkeypatch.setattr(command_matcher, "get_meme_generation_count", fake_get_count)
-
-    session = build_session("group-1", "group", "user-1")
-
-    assert await command_matcher.check_daily_limit(session) is True
-    assert captured["session"] is session
-    assert captured["id_type"] == expected_id_type
-    assert captured["time_start"] == fixed_now.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    assert captured["time_stop"] == fixed_now.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ) + timedelta(days=1)
-    assert captured["time_stop_inclusive"] is False
-
-
-@pytest.mark.parametrize("mode", ["USER", "GROUP", "UIG"])
-def test_get_daily_limit_max_count_returns_none_when_default_max_count_is_unlimited(
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-):
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode=mode, max_count=-1),
-    )
-
-    assert (
-        command_matcher.get_daily_limit_max_count(
-            build_session("group-1", "group", "user-1")
-        )
-        is None
-    )
-
-
-@pytest.mark.parametrize("mode", ["GROUP", "UIG"])
-def test_get_daily_limit_max_count_uses_group_override_for_group_modes(
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-):
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(
-            mode=mode,
-            max_count=9,
-            group_max_count={"group-1": 5},
-        ),
-    )
-
-    assert command_matcher.get_daily_limit_max_count(
-        build_session("group-1", "group", "user-1")
-    ) == 5
-
-
-def test_get_daily_limit_max_count_ignores_group_override_for_user_mode(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(
-            mode="USER",
-            max_count=9,
-            group_max_count={"group-1": 5},
-        ),
-    )
-
-    assert (
-        command_matcher.get_daily_limit_max_count(
-            build_session("group-1", "group", "user-1")
-        )
-        == 9
-    )
-
-
-@pytest.mark.parametrize("mode", ["GROUP", "UIG"])
-def test_get_daily_limit_max_count_ignores_group_override_in_private_session(
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-):
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(
-            mode=mode,
-            max_count=9,
-            group_max_count={"private-1": 1},
-        ),
-    )
-
-    assert (
-        command_matcher.get_daily_limit_max_count(
-            build_session("private-1", "private", "user-1")
-        )
-        == 9
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["USER", "GROUP", "UIG"])
-async def test_check_daily_limit_skips_query_when_default_max_count_is_unlimited(
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-):
-    count_mock = AsyncMock(return_value=999)
-
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode=mode, max_count=-1),
-    )
-    monkeypatch.setattr(command_matcher, "get_meme_generation_count", count_mock)
-
-    assert await command_matcher.check_daily_limit(
-        build_session("group-1", "group", "user-1")
-    )
-    count_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["GROUP", "UIG"])
-async def test_check_daily_limit_uses_group_override_when_default_max_count_is_unlimited(  # noqa: E501
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-):
-    count_mock = AsyncMock(return_value=3)
-
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(
-            mode=mode,
-            max_count=-1,
-            group_max_count={"group-1": 3},
-        ),
-    )
-    monkeypatch.setattr(command_matcher, "get_meme_generation_count", count_mock)
-
-    assert (
-        await command_matcher.check_daily_limit(
-            build_session("group-1", "group", "user-1")
-        )
-        is False
-    )
-    count_mock.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["GROUP", "UIG"])
-async def test_check_daily_limit_skips_query_in_private_session_when_default_is_unlimited(  # noqa: E501
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-):
-    count_mock = AsyncMock(return_value=999)
-
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(
-            mode=mode,
-            max_count=-1,
-            group_max_count={"private-1": 1},
-        ),
-    )
     monkeypatch.setattr(command_matcher, "get_meme_generation_count", count_mock)
 
     assert await command_matcher.check_daily_limit(
@@ -408,84 +214,188 @@ async def test_check_daily_limit_skips_query_in_private_session_when_default_is_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["GROUP", "UIG"])
-async def test_check_daily_limit_skips_query_when_group_override_is_unlimited(
+async def test_check_daily_limit_skips_query_for_superuser(
     monkeypatch: pytest.MonkeyPatch,
-    mode: str,
+    fresh_daily_limit_manager: DailyLimitManager,
 ):
-    count_mock = AsyncMock(return_value=999)
+    session = build_session("group-1", "group", "user-1")
+    count_mock = AsyncMock(return_value=99)
 
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(
-            mode=mode,
-            max_count=9,
-            group_max_count={"group-1": -1},
-        ),
-    )
+    fresh_daily_limit_manager.set_group_max_count(session, 2)
+    monkeypatch.setattr(command_matcher.get_driver().config, "superusers", {"user-1"})
     monkeypatch.setattr(command_matcher, "get_meme_generation_count", count_mock)
 
-    assert await command_matcher.check_daily_limit(
-        build_session("group-1", "group", "user-1")
-    )
+    assert await command_matcher.check_daily_limit(session)
     count_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["GROUP", "UIG"])
-async def test_check_daily_limit_uses_group_override_max_count(
+async def test_check_daily_limit_uses_group_user_and_local_day_window_for_group_limit(
     monkeypatch: pytest.MonkeyPatch,
-    mode: str,
+    fresh_daily_limit_manager: DailyLimitManager,
 ):
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(
-            mode=mode,
-            max_count=9,
-            group_max_count={"group-1": 3},
-        ),
-    )
-    monkeypatch.setattr(
-        command_matcher,
-        "get_meme_generation_count",
-        AsyncMock(return_value=3),
-    )
+    fixed_now = datetime(2026, 4, 10, 15, 30, 45, tzinfo=timezone(timedelta(hours=8)))
+    captured: dict[str, object] = {}
+    session = build_session("group-1", "group", "user-1")
 
-    assert (
-        await command_matcher.check_daily_limit(
-            build_session("group-1", "group", "user-1")
-        )
-        is False
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_now
+            return fixed_now.astimezone(tz)
+
+    async def fake_get_count(session_arg, id_type, **kwargs):
+        captured["session"] = session_arg
+        captured["id_type"] = id_type
+        captured.update(kwargs)
+        return 1
+
+    fresh_daily_limit_manager.set_group_max_count(session, 2)
+    monkeypatch.setattr(command_matcher, "datetime", FixedDateTime)
+    monkeypatch.setattr(command_matcher, "get_meme_generation_count", fake_get_count)
+
+    assert await command_matcher.check_daily_limit(session) is True
+    assert captured["session"] is session
+    assert captured["id_type"] == SessionIdType.GROUP_USER
+    assert captured["time_start"] == fixed_now.replace(
+        hour=0, minute=0, second=0, microsecond=0
     )
+    assert captured["time_stop"] == fixed_now.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) + timedelta(days=1)
+    assert captured["time_stop_inclusive"] is False
 
 
 @pytest.mark.asyncio
-async def test_check_daily_limit_blocks_when_today_count_reaches_max(
+async def test_check_daily_limit_uses_private_limit(
     monkeypatch: pytest.MonkeyPatch,
+    fresh_daily_limit_manager: DailyLimitManager,
 ):
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode="USER", max_count=2),
-    )
+    session = build_session("private-1", "private", "user-1")
+
+    fresh_daily_limit_manager.set_private_max_count(session, 2)
     monkeypatch.setattr(
         command_matcher,
         "get_meme_generation_count",
         AsyncMock(return_value=2),
     )
 
-    assert (
-        await command_matcher.check_daily_limit(
-            build_session("group-1", "group", "user-1")
-        )
-        is False
-    )
+    assert await command_matcher.check_daily_limit(session) is False
+
+
+def test_can_manage_daily_limit_allows_group_admin_and_superuser(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    group_admin = build_session("group-1", "group", "user-1", role_level=2)
+    private_superuser = build_session("private-1", "private", "user-2")
+
+    monkeypatch.setattr(command_matcher.get_driver().config, "superusers", {"user-2"})
+
+    assert manage_matcher.can_manage_daily_limit(group_admin) is True
+    assert manage_matcher.can_manage_daily_limit(private_superuser) is True
+
+
+def test_can_manage_daily_limit_rejects_group_member_and_private_non_superuser():
+    group_member = build_session("group-1", "group", "user-1", role_level=1)
+    private_user = build_session("private-1", "private", "user-2")
+
+    assert manage_matcher.can_manage_daily_limit(group_member) is False
+    assert manage_matcher.can_manage_daily_limit(private_user) is False
 
 
 @pytest.mark.asyncio
-async def test_process_rejects_when_daily_limit_reached(
+async def test_handle_daily_limit_command_queries_group_status(
+    fresh_daily_limit_manager: DailyLimitManager,
+):
+    matcher = FakeMatcher()
+
+    with pytest.raises(FinishCalled):
+        await manage_matcher.handle_daily_limit_command(
+            matcher,
+            build_session("group-1", "group", "user-1", role_level=2),
+            None,
+        )
+
+    assert matcher.messages == ["当前群未开启表情包次数限制"]
+
+
+@pytest.mark.asyncio
+async def test_handle_daily_limit_command_sets_group_limit(
+    fresh_daily_limit_manager: DailyLimitManager,
+):
+    matcher = FakeMatcher()
+    session = build_session("group-1", "group", "user-1", role_level=2)
+
+    with pytest.raises(FinishCalled):
+        await manage_matcher.handle_daily_limit_command(matcher, session, 5)
+
+    assert fresh_daily_limit_manager.get_limit_max_count(session) == 5
+    assert matcher.messages == ["已设置当前群内每人每日可制作 5 次表情包"]
+
+
+@pytest.mark.asyncio
+async def test_handle_daily_limit_command_closes_group_limit(
+    fresh_daily_limit_manager: DailyLimitManager,
+):
+    matcher = FakeMatcher()
+    session = build_session("group-1", "group", "user-1", role_level=2)
+    fresh_daily_limit_manager.set_group_max_count(session, 5)
+
+    with pytest.raises(FinishCalled):
+        await manage_matcher.handle_daily_limit_command(matcher, session, -1)
+
+    assert fresh_daily_limit_manager.get_limit_max_count(session) is None
+    assert matcher.messages == ["已关闭当前群的表情包次数限制"]
+
+
+@pytest.mark.asyncio
+async def test_handle_daily_limit_command_queries_private_status(
+    fresh_daily_limit_manager: DailyLimitManager,
+):
+    matcher = FakeMatcher()
+    session = build_session("private-1", "private", "user-1")
+    fresh_daily_limit_manager.set_private_max_count(session, 3)
+
+    with pytest.raises(FinishCalled):
+        await manage_matcher.handle_daily_limit_command(matcher, session, None)
+
+    assert matcher.messages == ["当前普通用户私聊每日可制作 3 次表情包"]
+
+
+@pytest.mark.asyncio
+async def test_handle_daily_limit_command_sets_private_limit(
+    fresh_daily_limit_manager: DailyLimitManager,
+):
+    matcher = FakeMatcher()
+    session = build_session("private-1", "private", "user-1")
+
+    with pytest.raises(FinishCalled):
+        await manage_matcher.handle_daily_limit_command(matcher, session, 4)
+
+    assert fresh_daily_limit_manager.get_limit_max_count(session) == 4
+    assert matcher.messages == ["已设置普通用户私聊每日可制作 4 次表情包"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_count", [0, -2])
+async def test_handle_daily_limit_command_rejects_invalid_count(
+    max_count: int,
+):
+    matcher = FakeMatcher()
+
+    with pytest.raises(FinishCalled):
+        await manage_matcher.handle_daily_limit_command(
+            matcher,
+            build_session("group-1", "group", "user-1", role_level=2),
+            max_count,
+        )
+
+    assert matcher.messages == ["次数必须为 -1 或正整数"]
+
+
+@pytest.mark.asyncio
+async def test_process_rejects_when_daily_limit_reached_with_custom_result(
     monkeypatch: pytest.MonkeyPatch,
 ):
     matcher = FakeMatcher()
@@ -498,7 +408,7 @@ async def test_process_rejects_when_daily_limit_reached(
     monkeypatch.setattr(
         command_matcher.memes_config,
         "memes_daily_limit",
-        MemeDailyLimitConfig(mode="UIG", max_count=2),
+        MemeDailyLimitConfig(result="这个群今天的表情包额度已经用完了"),
     )
 
     meme = SimpleNamespace(
@@ -506,7 +416,6 @@ async def test_process_rejects_when_daily_limit_reached(
         generate=lambda *_args, **_kwargs: None,
         info=SimpleNamespace(keywords=["测试"]),
     )
-    session = build_session("group-1", "group", "user-1")
 
     with pytest.raises(FinishCalled):
         await command_matcher.process(
@@ -514,50 +423,7 @@ async def test_process_rejects_when_daily_limit_reached(
             event=SimpleNamespace(),
             state={},
             matcher=matcher,
-            session=session,
-            meme=meme,
-            images=[],
-            texts=[],
-            options={},
-        )
-
-    assert matcher.messages == [command_matcher.DAILY_LIMIT_REACHED_MSG]
-    record_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_process_rejects_with_custom_daily_limit_result(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    matcher = FakeMatcher()
-
-    monkeypatch.setattr(
-        command_matcher, "check_daily_limit", AsyncMock(return_value=False)
-    )
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(
-            mode="UIG",
-            max_count=2,
-            result="这个群今天的表情包额度已经用完了",
-        ),
-    )
-
-    meme = SimpleNamespace(
-        key="test",
-        generate=lambda *_args, **_kwargs: None,
-        info=SimpleNamespace(keywords=["测试"]),
-    )
-    session = build_session("group-1", "group", "user-1")
-
-    with pytest.raises(FinishCalled):
-        await command_matcher.process(
-            bot=SimpleNamespace(),
-            event=SimpleNamespace(),
-            state={},
-            matcher=matcher,
-            session=session,
+            session=build_session("group-1", "group", "user-1"),
             meme=meme,
             images=[],
             texts=[],
@@ -565,17 +431,13 @@ async def test_process_rejects_with_custom_daily_limit_result(
         )
 
     assert matcher.messages == ["这个群今天的表情包额度已经用完了"]
+    record_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_process_daily_limit_notice_only_once_per_user_mode(
+async def test_process_daily_limit_notice_only_once_per_same_group_user(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode="USER", max_count=2),
-    )
     monkeypatch.setattr(
         command_matcher, "check_daily_limit", AsyncMock(return_value=False)
     )
@@ -620,150 +482,11 @@ async def test_process_daily_limit_notice_only_once_per_user_mode(
 
 
 @pytest.mark.asyncio
-async def test_process_daily_limit_notice_scope_is_per_group_for_group_mode(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode="GROUP", max_count=2),
-    )
-    monkeypatch.setattr(
-        command_matcher, "check_daily_limit", AsyncMock(return_value=False)
-    )
-
-    first = FakeMatcher()
-    second_same_group = FakeMatcher()
-    third_other_group = FakeMatcher()
-    meme = SimpleNamespace(
-        key="test",
-        generate=lambda *_args, **_kwargs: None,
-        info=SimpleNamespace(keywords=["测试"]),
-    )
-
-    with pytest.raises(FinishCalled):
-        await command_matcher.process(
-            bot=SimpleNamespace(),
-            event=SimpleNamespace(),
-            state={},
-            matcher=first,
-            session=build_session("group-1", "group", "user-1"),
-            meme=meme,
-            images=[],
-            texts=[],
-            options={},
-        )
-
-    with pytest.raises(FinishCalled):
-        await command_matcher.process(
-            bot=SimpleNamespace(),
-            event=SimpleNamespace(),
-            state={},
-            matcher=second_same_group,
-            session=build_session("group-1", "group", "user-2"),
-            meme=meme,
-            images=[],
-            texts=[],
-            options={},
-        )
-
-    with pytest.raises(FinishCalled):
-        await command_matcher.process(
-            bot=SimpleNamespace(),
-            event=SimpleNamespace(),
-            state={},
-            matcher=third_other_group,
-            session=build_session("group-2", "group", "user-2"),
-            meme=meme,
-            images=[],
-            texts=[],
-            options={},
-        )
-
-    assert first.messages == [command_matcher.DAILY_LIMIT_REACHED_MSG]
-    assert second_same_group.messages == [None]
-    assert third_other_group.messages == [command_matcher.DAILY_LIMIT_REACHED_MSG]
-
-
-@pytest.mark.asyncio
-async def test_process_daily_limit_notice_scope_is_per_group_user_for_uig_mode(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode="UIG", max_count=2),
-    )
-    monkeypatch.setattr(
-        command_matcher, "check_daily_limit", AsyncMock(return_value=False)
-    )
-
-    first = FakeMatcher()
-    second_same_group_user = FakeMatcher()
-    third_same_group_other_user = FakeMatcher()
-    meme = SimpleNamespace(
-        key="test",
-        generate=lambda *_args, **_kwargs: None,
-        info=SimpleNamespace(keywords=["测试"]),
-    )
-
-    with pytest.raises(FinishCalled):
-        await command_matcher.process(
-            bot=SimpleNamespace(),
-            event=SimpleNamespace(),
-            state={},
-            matcher=first,
-            session=build_session("group-1", "group", "user-1"),
-            meme=meme,
-            images=[],
-            texts=[],
-            options={},
-        )
-
-    with pytest.raises(FinishCalled):
-        await command_matcher.process(
-            bot=SimpleNamespace(),
-            event=SimpleNamespace(),
-            state={},
-            matcher=second_same_group_user,
-            session=build_session("group-1", "group", "user-1"),
-            meme=meme,
-            images=[],
-            texts=[],
-            options={},
-        )
-
-    with pytest.raises(FinishCalled):
-        await command_matcher.process(
-            bot=SimpleNamespace(),
-            event=SimpleNamespace(),
-            state={},
-            matcher=third_same_group_other_user,
-            session=build_session("group-1", "group", "user-2"),
-            meme=meme,
-            images=[],
-            texts=[],
-            options={},
-        )
-
-    assert first.messages == [command_matcher.DAILY_LIMIT_REACHED_MSG]
-    assert second_same_group_user.messages == [None]
-    assert third_same_group_other_user.messages == [
-        command_matcher.DAILY_LIMIT_REACHED_MSG
-    ]
-
-
-@pytest.mark.asyncio
 async def test_process_daily_limit_notice_resets_on_next_day(
     monkeypatch: pytest.MonkeyPatch,
 ):
     days = iter(["2026-04-11", "2026-04-11", "2026-04-12"])
     monkeypatch.setattr(command_matcher, "get_today_str", lambda: next(days))
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode="USER", max_count=2),
-    )
     monkeypatch.setattr(
         command_matcher, "check_daily_limit", AsyncMock(return_value=False)
     )
@@ -798,7 +521,54 @@ async def test_process_daily_limit_notice_resets_on_next_day(
 
 
 @pytest.mark.asyncio
-async def test_process_records_only_after_successful_send(
+async def test_process_records_only_after_successful_send_when_group_limit_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_daily_limit_manager: DailyLimitManager,
+):
+    order: list[str] = []
+    session = build_session("group-1", "group", "user-1")
+
+    class OrderedUniMessage(FakeUniMessage):
+        async def send(self):
+            order.append("send")
+
+    async def fake_record(_session, _meme_key):
+        order.append("record")
+
+    async def fake_generate(*_args, **_kwargs):
+        return b"generated-image"
+
+    fresh_daily_limit_manager.set_group_max_count(session, 2)
+    monkeypatch.setattr(command_matcher, "UniMessage", OrderedUniMessage)
+    monkeypatch.setattr(
+        command_matcher, "check_daily_limit", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(command_matcher, "record_meme_generation", fake_record)
+    monkeypatch.setattr(command_matcher, "run_sync", lambda _func: fake_generate)
+
+    meme = SimpleNamespace(
+        key="test",
+        generate=lambda *_args, **_kwargs: None,
+        info=SimpleNamespace(keywords=["测试"]),
+    )
+
+    await command_matcher.process(
+        bot=SimpleNamespace(),
+        event=SimpleNamespace(),
+        state={},
+        matcher=FakeMatcher(),
+        session=session,
+        meme=meme,
+        images=[],
+        texts=[],
+        options={},
+    )
+
+    assert order == ["send", "record"]
+
+
+@pytest.mark.asyncio
+async def test_process_does_not_record_when_group_limit_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ):
     order: list[str] = []
@@ -819,7 +589,6 @@ async def test_process_records_only_after_successful_send(
     )
     monkeypatch.setattr(command_matcher, "record_meme_generation", fake_record)
     monkeypatch.setattr(command_matcher, "run_sync", lambda _func: fake_generate)
-    monkeypatch.setattr(command_matcher.memes_config, "memes_daily_limit", None)
 
     meme = SimpleNamespace(
         key="test",
@@ -839,14 +608,107 @@ async def test_process_records_only_after_successful_send(
         options={},
     )
 
+    assert order == ["send"]
+
+
+@pytest.mark.asyncio
+async def test_process_records_in_private_when_private_limit_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_daily_limit_manager: DailyLimitManager,
+):
+    order: list[str] = []
+    session = build_session("private-1", "private", "user-1")
+
+    class OrderedUniMessage(FakeUniMessage):
+        async def send(self):
+            order.append("send")
+
+    async def fake_record(_session, _meme_key):
+        order.append("record")
+
+    async def fake_generate(*_args, **_kwargs):
+        return b"generated-image"
+
+    fresh_daily_limit_manager.set_private_max_count(session, 2)
+    monkeypatch.setattr(command_matcher, "UniMessage", OrderedUniMessage)
+    monkeypatch.setattr(
+        command_matcher, "check_daily_limit", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(command_matcher, "record_meme_generation", fake_record)
+    monkeypatch.setattr(command_matcher, "run_sync", lambda _func: fake_generate)
+
+    meme = SimpleNamespace(
+        key="test",
+        generate=lambda *_args, **_kwargs: None,
+        info=SimpleNamespace(keywords=["测试"]),
+    )
+
+    await command_matcher.process(
+        bot=SimpleNamespace(),
+        event=SimpleNamespace(),
+        state={},
+        matcher=FakeMatcher(),
+        session=session,
+        meme=meme,
+        images=[],
+        texts=[],
+        options={},
+    )
+
     assert order == ["send", "record"]
+
+
+@pytest.mark.asyncio
+async def test_process_does_not_record_when_private_limit_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    order: list[str] = []
+
+    class OrderedUniMessage(FakeUniMessage):
+        async def send(self):
+            order.append("send")
+
+    async def fake_record(_session, _meme_key):
+        order.append("record")
+
+    async def fake_generate(*_args, **_kwargs):
+        return b"generated-image"
+
+    monkeypatch.setattr(command_matcher, "UniMessage", OrderedUniMessage)
+    monkeypatch.setattr(
+        command_matcher, "check_daily_limit", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(command_matcher, "record_meme_generation", fake_record)
+    monkeypatch.setattr(command_matcher, "run_sync", lambda _func: fake_generate)
+
+    meme = SimpleNamespace(
+        key="test",
+        generate=lambda *_args, **_kwargs: None,
+        info=SimpleNamespace(keywords=["测试"]),
+    )
+
+    await command_matcher.process(
+        bot=SimpleNamespace(),
+        event=SimpleNamespace(),
+        state={},
+        matcher=FakeMatcher(),
+        session=build_session("private-1", "private", "user-1"),
+        meme=meme,
+        images=[],
+        texts=[],
+        options={},
+    )
+
+    assert order == ["send"]
 
 
 @pytest.mark.asyncio
 async def test_process_superuser_does_not_record_generation(
     monkeypatch: pytest.MonkeyPatch,
+    fresh_daily_limit_manager: DailyLimitManager,
 ):
     order: list[str] = []
+    session = build_session("group-1", "group", "user-1")
 
     class OrderedUniMessage(FakeUniMessage):
         async def send(self):
@@ -858,16 +720,12 @@ async def test_process_superuser_does_not_record_generation(
     async def fake_generate(*_args, **_kwargs):
         return b"generated-image"
 
+    fresh_daily_limit_manager.set_group_max_count(session, 2)
     monkeypatch.setattr(command_matcher.get_driver().config, "superusers", {"user-1"})
     monkeypatch.setattr(command_matcher, "UniMessage", OrderedUniMessage)
     monkeypatch.setattr(command_matcher, "record_meme_generation", fake_record)
     monkeypatch.setattr(command_matcher, "run_sync", lambda _func: fake_generate)
     monkeypatch.setattr(command_matcher, "get_meme_generation_count", AsyncMock())
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode="UIG", max_count=2),
-    )
 
     meme = SimpleNamespace(
         key="test",
@@ -880,7 +738,7 @@ async def test_process_superuser_does_not_record_generation(
         event=SimpleNamespace(),
         state={},
         matcher=FakeMatcher(),
-        session=build_session("group-1", "group", "user-1"),
+        session=session,
         meme=meme,
         images=[],
         texts=[],
@@ -888,116 +746,16 @@ async def test_process_superuser_does_not_record_generation(
     )
 
     assert order == ["send"]
-
-
-@pytest.mark.asyncio
-async def test_process_does_not_record_when_default_limit_is_unlimited(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    order: list[str] = []
-
-    class OrderedUniMessage(FakeUniMessage):
-        async def send(self):
-            order.append("send")
-
-    async def fake_record(_session, _meme_key):
-        order.append("record")
-
-    async def fake_generate(*_args, **_kwargs):
-        return b"generated-image"
-
-    monkeypatch.setattr(command_matcher, "UniMessage", OrderedUniMessage)
-    monkeypatch.setattr(
-        command_matcher, "check_daily_limit", AsyncMock(return_value=True)
-    )
-    monkeypatch.setattr(command_matcher, "record_meme_generation", fake_record)
-    monkeypatch.setattr(command_matcher, "run_sync", lambda _func: fake_generate)
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(mode="UIG", max_count=-1),
-    )
-
-    meme = SimpleNamespace(
-        key="test",
-        generate=lambda *_args, **_kwargs: None,
-        info=SimpleNamespace(keywords=["测试"]),
-    )
-
-    await command_matcher.process(
-        bot=SimpleNamespace(),
-        event=SimpleNamespace(),
-        state={},
-        matcher=FakeMatcher(),
-        session=build_session("group-1", "group", "user-1"),
-        meme=meme,
-        images=[],
-        texts=[],
-        options={},
-    )
-
-    assert order == ["send"]
-
-
-@pytest.mark.asyncio
-async def test_process_records_when_group_override_enables_limit(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    order: list[str] = []
-
-    class OrderedUniMessage(FakeUniMessage):
-        async def send(self):
-            order.append("send")
-
-    async def fake_record(_session, _meme_key):
-        order.append("record")
-
-    async def fake_generate(*_args, **_kwargs):
-        return b"generated-image"
-
-    monkeypatch.setattr(command_matcher, "UniMessage", OrderedUniMessage)
-    monkeypatch.setattr(
-        command_matcher, "check_daily_limit", AsyncMock(return_value=True)
-    )
-    monkeypatch.setattr(command_matcher, "record_meme_generation", fake_record)
-    monkeypatch.setattr(command_matcher, "run_sync", lambda _func: fake_generate)
-    monkeypatch.setattr(
-        command_matcher.memes_config,
-        "memes_daily_limit",
-        MemeDailyLimitConfig(
-            mode="UIG",
-            max_count=-1,
-            group_max_count={"group-1": 2},
-        ),
-    )
-
-    meme = SimpleNamespace(
-        key="test",
-        generate=lambda *_args, **_kwargs: None,
-        info=SimpleNamespace(keywords=["测试"]),
-    )
-
-    await command_matcher.process(
-        bot=SimpleNamespace(),
-        event=SimpleNamespace(),
-        state={},
-        matcher=FakeMatcher(),
-        session=build_session("group-1", "group", "user-1"),
-        meme=meme,
-        images=[],
-        texts=[],
-        options={},
-    )
-
-    assert order == ["send", "record"]
 
 
 @pytest.mark.asyncio
 async def test_process_does_not_record_when_generation_fails(
     monkeypatch: pytest.MonkeyPatch,
+    fresh_daily_limit_manager: DailyLimitManager,
 ):
     record_mock = AsyncMock()
     matcher = FakeMatcher()
+    session = build_session("group-1", "group", "user-1")
 
     class DummyFeedback:
         def __init__(self, feedback: str):
@@ -1006,6 +764,7 @@ async def test_process_does_not_record_when_generation_fails(
     async def fake_generate(*_args, **_kwargs):
         return DummyFeedback("生成失败")
 
+    fresh_daily_limit_manager.set_group_max_count(session, 2)
     monkeypatch.setattr(command_matcher, "UniMessage", FakeUniMessage)
     monkeypatch.setattr(command_matcher, "MemeFeedback", DummyFeedback)
     monkeypatch.setattr(
@@ -1026,7 +785,7 @@ async def test_process_does_not_record_when_generation_fails(
             event=SimpleNamespace(),
             state={},
             matcher=matcher,
-            session=build_session("group-1", "group", "user-1"),
+            session=session,
             meme=meme,
             images=[],
             texts=[],

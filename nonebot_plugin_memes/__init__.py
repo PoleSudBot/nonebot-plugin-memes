@@ -30,6 +30,7 @@ __plugin_meta__ = PluginMetadata(
         "  [时间段] 可选：日/周/月/年\n\n"
         "## ⚙️ 表情管理\n\n"
         "- `启用表情/禁用表情 [关键词]` - 开启或关闭某个表情\n"
+        "- `表情包次数 [次数]` - 配置当前群或普通用户私聊的每日次数限制\n"
     ),
     type="application",
     homepage="https://github.com/noneplugin/nonebot-plugin-memes",

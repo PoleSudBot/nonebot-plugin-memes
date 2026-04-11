@@ -50,6 +50,11 @@ from nonebot_plugin_uninfo import Interface, QryItrface, Session, Uninfo, User
 from nonebot_plugin_waiter import waiter
 
 from ..config import memes_config
+from ..daily_limit_manager import (
+    daily_limit_manager,
+    get_daily_limit_notice_key,
+    is_superuser,
+)
 from ..manager import meme_manager
 from ..recorder import (
     SessionIdType,
@@ -64,20 +69,6 @@ DAILY_LIMIT_REACHED_MSG = "今日表情包制作次数已达上限，请明天�
 _daily_limit_notice_date = ""
 _daily_limit_notice_keys: set[str] = set()
 
-
-def get_daily_limit_id_type() -> Optional[SessionIdType]:
-    daily_limit = memes_config.memes_daily_limit
-    if not daily_limit:
-        return None
-
-    mode_mapping = {
-        "USER": SessionIdType.USER,
-        "GROUP": SessionIdType.GROUP,
-        "UIG": SessionIdType.GROUP_USER,
-    }
-    return mode_mapping[daily_limit.mode]
-
-
 def get_daily_limit_result() -> str:
     daily_limit = memes_config.memes_daily_limit
     if daily_limit and daily_limit.result:
@@ -87,39 +78,6 @@ def get_daily_limit_result() -> str:
 
 def get_today_str() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d")
-
-
-def is_superuser(session: Session) -> bool:
-    user = getattr(session, "user", None)
-    user_id = getattr(user, "id", None)
-    if user_id is None:
-        return False
-    return str(user_id) in get_driver().config.superusers
-
-
-def is_private_scene(session: Session) -> bool:
-    if hasattr(session.scene, "is_private"):
-        return bool(session.scene.is_private)
-    return getattr(session.scene.type, "value", None) == "private"
-
-
-def normalize_daily_limit_max_count(max_count: int) -> Optional[int]:
-    return None if max_count == -1 else max_count
-
-
-def get_daily_limit_notice_key(session: Session) -> Optional[str]:
-    id_type = get_daily_limit_id_type()
-    if not id_type:
-        return None
-
-    key = f"{session.scope}:{session.self_id}:"
-    if id_type == SessionIdType.USER:
-        return key + f"user:{session.user.id}"
-    if id_type == SessionIdType.GROUP:
-        return key + f"scene:{session.scene.type.value}:{session.scene.id}"
-    return key + (
-        f"scene:{session.scene.type.value}:{session.scene.id}:user:{session.user.id}"
-    )
 
 
 def should_send_daily_limit_notice(session: Session) -> bool:
@@ -141,26 +99,12 @@ def should_send_daily_limit_notice(session: Session) -> bool:
 
 
 def get_daily_limit_max_count(session: Session) -> Optional[int]:
-    daily_limit = memes_config.memes_daily_limit
-    if not daily_limit:
-        return None
-
-    if daily_limit.mode == "USER" or is_private_scene(session):
-        return normalize_daily_limit_max_count(daily_limit.max_count)
-
-    group_max_count = daily_limit.group_max_count.get(str(session.scene.id))
-    if group_max_count is None:
-        return normalize_daily_limit_max_count(daily_limit.max_count)
-    return normalize_daily_limit_max_count(group_max_count)
+    return daily_limit_manager.get_limit_max_count(session)
 
 
 def should_record_meme_generation(session: Session) -> bool:
     if is_superuser(session):
         return False
-
-    daily_limit = memes_config.memes_daily_limit
-    if not daily_limit:
-        return True
 
     return get_daily_limit_max_count(session) is not None
 
@@ -169,16 +113,8 @@ async def check_daily_limit(session: Session) -> bool:
     if is_superuser(session):
         return True
 
-    daily_limit = memes_config.memes_daily_limit
-    if not daily_limit:
-        return True
-
     max_count = get_daily_limit_max_count(session)
     if max_count is None:
-        return True
-
-    id_type = get_daily_limit_id_type()
-    if not id_type:
         return True
 
     time_start = datetime.now().astimezone().replace(
@@ -187,7 +123,7 @@ async def check_daily_limit(session: Session) -> bool:
     time_stop = time_start + timedelta(days=1)
     count = await get_meme_generation_count(
         session,
-        id_type,
+        SessionIdType.GROUP_USER,
         time_start=time_start,
         time_stop=time_stop,
         time_stop_inclusive=False,
